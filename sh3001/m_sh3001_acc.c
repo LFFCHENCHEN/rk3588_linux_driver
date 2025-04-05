@@ -5,6 +5,9 @@
 #include <linux/i2c-dev.h> // Added to define I2C_RDWR
 #include <linux/module.h>  // Ensure this is included for MODULE_DEVICE_TABLE
 #include <linux/delay.h>
+#include <linux/input.h>
+#include <linux/timer.h>
+#include <linux/workqueue.h> // Include workqueue header
 
 #define DEVICE_NAME "sh3001_aac"
 #define CLASS_NAME "i2c_class"
@@ -15,7 +18,79 @@
 static struct i2c_client *client;
 static struct class *i2c_class;
 static struct device *i2c_device;
+
+static struct input_dev *input_dev;
+static struct timer_list m_timer;
+static struct workqueue_struct *i2c_workqueue;
+static struct work_struct i2c_work;
 static int major_num;
+
+int i2c_read_bytes(unsigned char addr, unsigned int len, unsigned char *des)
+{
+    unsigned char address = addr;
+    struct i2c_msg msgs[2];
+    int ret;
+
+    msgs[0].flags = !I2C_M_RD;   // 写
+    msgs[0].addr = client->addr; // 器件地址
+    msgs[0].len = 1;
+    msgs[0].buf = &address;
+
+    msgs[1].flags = I2C_M_RD;    // 读
+    msgs[1].addr = client->addr; // 器件地址
+    msgs[1].len = len;           // 读取的数据长度
+    msgs[1].buf = des;
+
+    ret = i2c_transfer(client->adapter, msgs, 2);
+    if (ret == 2)
+        return 0;
+    else
+        return -1;
+}
+
+static int i2c_write_bytes(unsigned char addr, unsigned len, unsigned char *buf)
+{
+    struct i2c_msg msg;
+    msg.addr = client->addr;
+    msg.flags = 0;
+    msg.len = len;
+    msg.buf = buf;
+
+    i2c_transfer(client->adapter, &msg, 1);
+
+    return 0;
+}
+
+static void i2c_work_func(struct work_struct *work)
+{
+    u8 data[6] = {0x00};
+    short x, y, z;
+
+    // Perform I2C read operation
+    i2c_read_bytes(0x00, 6, data);
+
+    // Combine high and low bytes
+    x = (data[1] << 8) | data[0];
+    y = (data[3] << 8) | data[2];
+    z = (data[5] << 8) | data[4];
+
+    // Report the accelerometer data
+    input_report_abs(input_dev, ABS_X, x);
+    input_report_abs(input_dev, ABS_Y, y);
+    input_report_abs(input_dev, ABS_Z, z);
+    input_sync(input_dev);
+
+    // printk("x:%02x y:%02x z:%02x", x, y, z);
+}
+
+static void m_timer_func(struct timer_list *t)
+{
+    // Queue the work instead of performing I2C read directly
+    queue_work(i2c_workqueue, &i2c_work);
+
+    // Reset timer for next reading (100ms)
+    mod_timer(&m_timer, jiffies + msecs_to_jiffies(1000));
+}
 
 static int m_open(struct inode *inode, struct file *file)
 {
@@ -32,50 +107,25 @@ static long m_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     unsigned long *usr_buf = (unsigned long *)arg;
     unsigned char addr;
-    unsigned char data = 0x00;
-    unsigned char write_buf[2];
     unsigned int ker_buf[2];
-    struct i2c_msg msgs[2];
 
     if (copy_from_user(ker_buf, usr_buf, sizeof(ker_buf)))
     {
         return -EFAULT; // Return error if copy_from_user fails
     }
-
     addr = ker_buf[0];
+
     switch (cmd)
     {
     case IO_READ:
-        msgs[0].addr = client->addr;
-        msgs[0].flags = 0;
-        msgs[0].len = 1;
-        msgs[0].buf = &addr;
-
-        msgs[1].addr = client->addr;
-        msgs[1].flags = I2C_M_RD;
-        msgs[1].len = 1;
-        msgs[1].buf = &data;
-        i2c_transfer(client->adapter, msgs, 2);
-
-        ker_buf[1] = data;
-
+        i2c_read_bytes(addr, 1, (unsigned char *)&ker_buf[1]);
         if (copy_to_user(usr_buf, ker_buf, sizeof(ker_buf)))
         {
             return -EFAULT; // Return error if copy_to_user fails
         }
         break;
     case IO_WRITE:
-        write_buf[0] = addr;
-        write_buf[1] = ker_buf[1];
-
-        msgs[0].addr = client->addr;
-        msgs[0].flags = 0; /* 写 */
-        msgs[0].len = 2;
-        msgs[0].buf = write_buf;
-
-        i2c_transfer(client->adapter, msgs, 1);
-
-        mdelay(20);
+        i2c_write_bytes(addr, 1, (unsigned char *)&ker_buf[1]);
         break;
     default:
         break;
@@ -91,7 +141,7 @@ static struct file_operations fops = {
 
 static int m_probe(struct i2c_client *cli, const struct i2c_device_id *id)
 {
-    printk(KERN_INFO "sh3001 device probed.\n");
+    // 创建sh3001设备
     if (!i2c_check_functionality(cli->adapter, I2C_FUNC_I2C))
     {
         pr_err("I2C_FUNC_I2C not supported.\n");
@@ -120,18 +170,69 @@ static int m_probe(struct i2c_client *cli, const struct i2c_device_id *id)
         pr_err("Failed to create device.\n");
         return PTR_ERR(i2c_device);
     }
-
     client = cli;
     printk(KERN_INFO "Device node created successfully: /dev/%s\n", DEVICE_NAME);
+    // 初始化input输入设备
+    input_dev = input_allocate_device();
+    if (!input_dev)
+    {
+        device_destroy(i2c_class, MKDEV(major_num, 0));
+        class_destroy(i2c_class);
+        unregister_chrdev(major_num, DEVICE_NAME);
+        pr_err("Failed to allocate input device.\n");
+        return -ENOMEM;
+    }
+
+    input_dev->name = "sh3001_accelerometer";
+    input_dev->id.bustype = BUS_I2C;
+    set_bit(EV_ABS, input_dev->evbit);
+    input_set_abs_params(input_dev, ABS_X, -32768, 32767, 0, 0);
+    input_set_abs_params(input_dev, ABS_Y, -32768, 32767, 0, 0);
+    input_set_abs_params(input_dev, ABS_Z, -32768, 32767, 0, 0);
+
+    if (input_register_device(input_dev))
+    {
+        input_free_device(input_dev);
+        device_destroy(i2c_class, MKDEV(major_num, 0));
+        class_destroy(i2c_class);
+        unregister_chrdev(major_num, DEVICE_NAME);
+        pr_err("Failed to register input device.\n");
+        return -ENODEV;
+    }
+
+    // Initialize workqueue
+    i2c_workqueue = create_singlethread_workqueue("i2c_workqueue");
+    if (!i2c_workqueue)
+    {
+        pr_err("Failed to create workqueue.\n");
+        return -ENOMEM;
+    }
+    INIT_WORK(&i2c_work, i2c_work_func);
+
+    // Initialize timer
+    timer_setup(&m_timer, m_timer_func, 0);
+    mod_timer(&m_timer, jiffies + msecs_to_jiffies(1000));
+
+    printk(KERN_INFO "sh3001 device probe ok.\n");
     return 0;
 }
 
 static int m_remove(struct i2c_client *cl)
 {
+    del_timer_sync(&m_timer);
+    input_unregister_device(input_dev);
     device_destroy(i2c_class, MKDEV(major_num, 0));
     class_unregister(i2c_class);
     class_destroy(i2c_class);
     unregister_chrdev(major_num, DEVICE_NAME);
+
+    // Destroy workqueue
+    if (i2c_workqueue)
+    {
+        flush_workqueue(i2c_workqueue);
+        destroy_workqueue(i2c_workqueue);
+    }
+
     return 0;
 }
 

@@ -1,8 +1,6 @@
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/module.h>
 #include <linux/input.h>
-#include <linux/timer.h>
 #include <linux/timer.h>
 
 static struct input_dev *input_device;
